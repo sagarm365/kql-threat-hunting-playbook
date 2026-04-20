@@ -1,0 +1,42 @@
+// ============================================================
+// Detection: AiTM Phishing Attack Detection
+// Description: Detects Adversary-in-the-Middle phishing attacks
+//              by identifying suspicious token usage patterns
+//              and impossible travel after credential submission
+// Author: Sagar Patel
+// MITRE ATT&CK: T1557 - Adversary-in-the-Middle
+// Platform: Microsoft Defender XDR / Microsoft Sentinel
+// ============================================================
+
+let timeframe = 1d;
+let suspicious_ips = 
+    AADSignInEventsBeta
+    | where Timestamp > ago(timeframe)
+    | where ResultType == 0 // Successful sign-in
+    | where NetworkLocationDetails has "anonymousProxy" 
+        or NetworkLocationDetails has "tor"
+    | project AccountUpn, IPAddress, Timestamp, SessionId;
+// Detect session cookie theft - sign-in from new IP 
+// using existing session within short timeframe
+AADSignInEventsBeta
+| where Timestamp > ago(timeframe)
+| where ResultType == 0
+| join kind=inner suspicious_ips on AccountUpn
+| where IPAddress != IPAddress1 // Different IP from suspicious sign-in
+| where abs(datetime_diff('minute', Timestamp, Timestamp1)) < 60
+| project
+    Timestamp,
+    AccountUpn,
+    OriginalIP = IPAddress1,
+    NewIP = IPAddress,
+    SessionId,
+    TimeDiffMinutes = abs(datetime_diff('minute', Timestamp, Timestamp1))
+| where TimeDiffMinutes < 60
+| order by Timestamp desc
+
+// ============================================================
+// False Positive Notes:
+// - VPN users may trigger this - whitelist corporate VPN ranges
+// - Travelling users - correlate with HR travel data if available
+// - Tune NetworkLocationDetails based on your environment
+// ============================================================
