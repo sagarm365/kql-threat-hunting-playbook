@@ -28,3 +28,62 @@ AADSignInEventsBeta
 | where IPAddress != ClickIP
 | project Timestamp, AccountUpn, ClickTime, ClickIP, SignInIP = IPAddress, Country, City, Application, Browser, UserAgent, Url
 | order by Timestamp desc
+
+<b>Version 2.0:</b>
+<b><h3>Reduce false positives:</h3)</b>
+let MaliciousClicks = UrlClickEvents
+| where Timestamp > ago(24h)
+| where ThreatTypes has_any ("Phish", "Malware")
+| where IsClickedThrough == true
+| project AccountUpn, ClickTime = Timestamp, ClickIP = IPAddress, Url, Workload, DetectionMethods, ThreatTypes;
+let AffectedUsers = MaliciousClicks
+| summarize by AccountUpn;
+let HistoricalIPBaseline =
+AADSignInEventsBeta
+| where Timestamp >= ago(30d)
+| where ErrorCode == 0
+| where AccountUpn in (AffectedUsers)
+| summarize HistoricalIPCount = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp) 
+  by AccountUpn, IPAddress;
+let SuspiciousSignIns =
+AADSignInEventsBeta
+| where Timestamp > ago(24h)
+| where ErrorCode == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| where AccountUpn in (AffectedUsers)
+| where Application !in (ExcludedApps)
+| join kind=inner MaliciousClicks on AccountUpn
+| where abs(datetime_diff("minute", Timestamp, ClickTime)) <= 10
+| where IPAddress != ClickIP
+| project Timestamp, AccountUpn, SessionId, ClickTime, Url, ThreatTypes, ClickIP, SignInIP = IPAddress, Country, State, City, Application, Browser, ClientAppUsed, UserAgent, DeviceName, OSPlatform, DeviceTrustType, IsManaged,
+IsCompliant, RiskLevelAggregated, RiskState, ConditionalAccessStatus, NetworkLocationDetails;
+SuspiciousSignIns
+| join kind=leftouter HistoricalIPBaseline
+on AccountUpn, $left.SignInIP == $right.IPAddress
+// IP familiarity scoring
+| extend
+IPSeenBefore = isnotempty(HistoricalIPCount),
+HistoricalIPCount = coalesce(HistoricalIPCount, 0)
+| extend IPRiskLevel = case(
+IPSeenBefore == false, "High Risk - New IP",
+HistoricalIPCount < 3, "Medium Risk - Rare IP",
+"Lower Risk - Frequent IP"
+)
+// Device / identity risk
+| extend DeviceRisk = case(
+IsManaged == 0 and IsCompliant == 0, "Unmanaged & Non-Compliant",
+IsManaged == 0, "Unmanaged Device",
+IsCompliant == 0, "Non-Compliant Device",
+"Managed & Compliant"
+)
+| extend IdentityRisk = case(
+RiskLevelAggregated == 100, "High",
+RiskLevelAggregated == 50, "Medium",
+RiskLevelAggregated == 10, "Low",
+"None"
+)
+// Final high-confidence filtering
+| where IPRiskLevel startswith "High" or RiskLevelAggregated >= 50 or DeviceRisk != "Managed & Compliant"
+| project Timestamp, AccountUpn, ThreatTypes, Url, ClickTime, ClickIP, SignInIP, Country, State, City, Application, Browser, ClientAppUsed, DeviceName, OSPlatform, DeviceRisk, IdentityRisk, IPRiskLevel, HistoricalIPCount,
+ConditionalAccessStatus, SessionId
+| order by Timestamp desc
