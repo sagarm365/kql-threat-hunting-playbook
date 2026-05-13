@@ -12,92 +12,222 @@ Built for Microsoft Defender XDR using `AADSignInEventsBeta`.
 
 ---
 
-## Detection Goals
+## Detection Query
 
-This detection identifies abnormal authenticated session reuse by analyzing:
+```kusto
+// ============================================================
+// Title:       Suspicious Session Replay & AiTM Detection
+// Description: Detects possible AiTM/session replay activity
+//              by identifying abnormal SessionId reuse across
+//              multiple IPs, browsers, and devices compared
+//              against 14-day historical user behavior.
+//
+// Author:      Sagar Patel
+// Date:        2026
+//
+// MITRE ATT&CK:
+//   T1539      - Steal Web Session Cookie
+//   T1557      - Adversary-in-the-Middle
+//   T1550.004  - Use Alternate Authentication Material
+//
+// Platform:    Microsoft Defender XDR
+// Severity:    High
+//
+// False Positives:
+//   - VPN IP rotation
+//   - Mobile/WiFi switching
+//   - Browser upgrades
+//   - Shared VDI environments
+//
+// Tuning Recommendations:
+//   - Tune RiskScore threshold per environment
+//   - Add corporate VPN exclusions if required
+//   - Add watchlists for privileged identities
+// ============================================================
 
-* Same `SessionId` across multiple IPs
-* Browser inconsistencies
-* Unknown devices
-* Session spread anomalies
-* Historical user behavior deviations
-* Risk-based suspiciousness scoring
 
-The query compares current sign-in activity against a 14-day historical baseline to reduce false positives while preserving visibility into sophisticated replay attacks.
+// =====================
+// Historical User Baseline (14 Days)
+// =====================
+let UserBaseline =
+AADSignInEventsBeta
+| where Timestamp between (ago(14d) .. ago(1d))
+| where ErrorCode == 0
+| summarize
+    KnownCountries = make_set(Country, 20),
+    KnownBrowsers  = make_set(Browser, 20),
+    KnownIPs       = make_set(IPAddress, 50),
+    KnownDevices   = make_set(DeviceName, 30)
+    by AccountUpn;
+
+
+// =====================
+// Current Session Activity (24 Hours)
+// =====================
+let CurrentSessions =
+AADSignInEventsBeta
+| where Timestamp > ago(24h)
+| where ErrorCode == 0
+| where isnotempty(SessionId)
+
+| summarize
+    IPs              = make_set(IPAddress, 10),
+    Countries        = make_set(Country, 10),
+    Browsers         = make_set(Browser, 10),
+    UserAgents       = make_set(UserAgent, 10),
+    Applications     = make_set(Application, 10),
+    DeviceNames      = make_set(DeviceName, 10),
+
+    SignInCount      = count(),
+
+    FirstSeen        = min(Timestamp),
+    LastSeen         = max(Timestamp)
+
+    by AccountUpn, SessionId
+
+// Core replay indicators
+| where array_length(IPs) > 1
+| where array_length(Browsers) > 1;
+
+
+// =====================
+// Correlation & Enrichment
+// =====================
+CurrentSessions
+| join kind=leftouter UserBaseline on AccountUpn
+
+// Accounts with baseline only
+| where isnotempty(KnownCountries)
+
+
+// =====================
+// Identify New/Abnormal Behavior
+// =====================
+| extend NewCountries =
+    set_difference(Countries, KnownCountries)
+
+| extend NewBrowsers =
+    set_difference(Browsers, KnownBrowsers)
+
+| extend NewIPs =
+    set_difference(IPs, KnownIPs)
+
+| extend NewDevices =
+    set_difference(DeviceNames, KnownDevices)
+
+
+// =====================
+// Risk Scoring
+// =====================
+| extend RiskScore =
+    (array_length(NewBrowsers)  * 3) +
+    (array_length(NewDevices)   * 3) +
+    (array_length(NewIPs)       * 2) +
+    (array_length(NewCountries) * 1)
+
+
+// =====================
+// Session Metrics
+// =====================
+| extend SessionDurationMinutes =
+    datetime_diff("minute", LastSeen, FirstSeen)
+
+
+// =====================
+// False Positive Reduction
+// =====================
+
+// Require abnormal behavior
+| where
+    array_length(NewBrowsers) > 0
+    or array_length(NewDevices) > 0
+    or array_length(NewIPs) > 1
+
+// Reduce token refresh noise
+| where SignInCount >= 2
+
+// Minimum suspiciousness threshold
+| where RiskScore >= 3
+
+
+// =====================
+// Account Classification
+// =====================
+| extend AccountType =
+    case(
+        AccountUpn startswith "svc-", "Service Account",
+        AccountUpn startswith "app-", "Application Account",
+        AccountUpn contains "admin", "Privileged Account",
+        "User Account"
+    )
+
+
+// =====================
+// Priority Classification
+// =====================
+| extend Priority =
+    case(
+        RiskScore >= 8 and AccountType == "Privileged Account", "Critical",
+        RiskScore >= 6, "High",
+        RiskScore >= 3, "Medium",
+        "Low"
+    )
+
+
+// =====================
+// Reduce Common Microsoft Noise
+// =====================
+| where not(Applications has "Microsoft Teams")
+
+
+// =====================
+// Final Output
+// =====================
+| project
+    Timestamp = LastSeen,
+
+    Priority,
+    RiskScore,
+
+    AccountUpn,
+    AccountType,
+
+    SessionId,
+
+    SignInCount,
+    SessionDurationMinutes,
+
+    FirstSeen,
+    LastSeen,
+
+    Countries,
+    NewCountries,
+
+    IPs,
+    NewIPs,
+
+    Browsers,
+    NewBrowsers,
+
+    DeviceNames,
+    NewDevices,
+
+    UserAgents,
+    Applications
+
+| order by RiskScore desc, LastSeen desc
+```
 
 ---
 
-## Key Features
+## Detection Highlights
 
-### Behavioral Baseline Comparison
-
-Learns historical:
-
-* Countries
-* Browsers
-* Devices
-* IP addresses
-
-for each user.
-
----
-
-### False Positive Reduction
-
-Reduces noise from:
-
-* Microsoft token refresh activity
-* Mobile roaming
-* Legitimate IP rotation
-* Teams authentication refreshes
-
----
-
-### Risk Scoring
-
-Prioritizes alerts based on:
-
-* New browser usage
-* New device usage
-* New IP usage
-* New country activity
-
----
-
-### Account Classification
-
-Classifies:
-
-* Service accounts
-* Application accounts
-* Privileged accounts
-* User accounts
-
-instead of excluding them.
-
----
-
-## Detection Philosophy
-
-Modern AiTM attackers frequently use:
-
-* Same-country VPS infrastructure
-* Residential proxies
-* Local cloud providers
-
-Therefore:
-
-* Geography alone is NOT a reliable detection strategy.
-* Session behavior anomalies are more valuable.
-
-This detection prioritizes:
-
-* Browser anomalies
-* Device anomalies
-* Session replay behavior
-* MFA-approved session reuse
-
-instead of relying only on impossible travel logic.
+* Detects abnormal authenticated session reuse
+* Uses 14-day behavioral baselining
+* Reduces false positives from token refresh activity
+* Prioritizes browser/device anomalies over geography
+* Includes risk scoring and account classification
+* Suitable for Defender XDR / Sentinel analytic rules
 
 ---
 
@@ -113,8 +243,6 @@ instead of relying only on impossible travel logic.
 
 ## Threat Coverage
 
-Effective against:
-
 * Evilginx
 * Tycoon2FA
 * Mamba2FA
@@ -129,34 +257,6 @@ Effective against:
 * Microsoft Defender XDR
 * Advanced Hunting
 * KQL
-
----
-
-## Detection Type
-
-* Identity Threat Detection
-* Cloud Threat Hunting
-* Session Replay Detection
-* AiTM Detection
-* Behavioral Analytics
-
----
-
-## Notes
-
-This query is designed for:
-
-* Threat hunters
-* SOC analysts
-* Detection engineers
-* Incident responders
-
-and can be adapted into:
-
-* Sentinel analytics rules
-* Defender custom detections
-* UEBA workflows
-* SOC enrichment pipelines
 
 ---
 
