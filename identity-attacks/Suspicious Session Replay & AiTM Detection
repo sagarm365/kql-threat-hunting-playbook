@@ -1,0 +1,165 @@
+# Suspicious Session Replay & AiTM Detection — Microsoft Defender XDR
+
+Production-grade KQL detection for identifying possible:
+
+* Adversary-in-the-Middle (AiTM) attacks
+* Session cookie replay
+* MFA session hijacking
+* Token theft
+* Stolen cloud session reuse
+
+Built for Microsoft Defender XDR using `AADSignInEventsBeta`.
+
+---
+
+## Detection Goals
+
+This detection identifies abnormal authenticated session reuse by analyzing:
+
+* Same `SessionId` across multiple IPs
+* Browser inconsistencies
+* Unknown devices
+* Session spread anomalies
+* Historical user behavior deviations
+* Risk-based suspiciousness scoring
+
+The query compares current sign-in activity against a 14-day historical baseline to reduce false positives while preserving visibility into sophisticated replay attacks.
+
+---
+
+## Key Features
+
+### Behavioral Baseline Comparison
+
+Learns historical:
+
+* Countries
+* Browsers
+* Devices
+* IP addresses
+
+for each user.
+
+---
+
+### False Positive Reduction
+
+Reduces noise from:
+
+* Microsoft token refresh activity
+* Mobile roaming
+* Legitimate IP rotation
+* Teams authentication refreshes
+
+---
+
+### Risk Scoring
+
+Prioritizes alerts based on:
+
+* New browser usage
+* New device usage
+* New IP usage
+* New country activity
+
+---
+
+### Account Classification
+
+Classifies:
+
+* Service accounts
+* Application accounts
+* Privileged accounts
+* User accounts
+
+instead of excluding them.
+
+---
+
+## Detection Philosophy
+
+Modern AiTM attackers frequently use:
+
+* Same-country VPS infrastructure
+* Residential proxies
+* Local cloud providers
+
+Therefore:
+
+* Geography alone is NOT a reliable detection strategy.
+* Session behavior anomalies are more valuable.
+
+This detection prioritizes:
+
+* Browser anomalies
+* Device anomalies
+* Session replay behavior
+* MFA-approved session reuse
+
+instead of relying only on impossible travel logic.
+
+---
+
+## MITRE ATT&CK Mapping
+
+| Technique | Description                           |
+| --------- | ------------------------------------- |
+| T1539     | Steal Web Session Cookie              |
+| T1557     | Adversary-in-the-Middle               |
+| T1550.004 | Use Alternate Authentication Material |
+
+---
+
+## Threat Coverage
+
+Effective against:
+
+* Evilginx
+* Tycoon2FA
+* Mamba2FA
+* QR-code phishing replay
+* OAuth session abuse
+* BEC-related session hijacking
+
+---
+
+## Platform
+
+* Microsoft Defender XDR
+* Advanced Hunting
+* KQL
+
+---
+
+## Detection Type
+
+* Identity Threat Detection
+* Cloud Threat Hunting
+* Session Replay Detection
+* AiTM Detection
+* Behavioral Analytics
+
+---
+
+## Notes
+
+This query is designed for:
+
+* Threat hunters
+* SOC analysts
+* Detection engineers
+* Incident responders
+
+and can be adapted into:
+
+* Sentinel analytics rules
+* Defender custom detections
+* UEBA workflows
+* SOC enrichment pipelines
+
+---
+
+## Author
+
+Sagar Patel
