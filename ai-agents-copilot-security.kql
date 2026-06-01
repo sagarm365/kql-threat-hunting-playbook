@@ -1,0 +1,206 @@
+// ============================================================
+// KQL THREAT HUNTING — AI AGENTS & EXPOSURE GRAPH
+// Microsoft Defender XDR | AIAgentsInfo | ExposureGraphNodes/Edges
+// ============================================================
+// Author      : Sagar Patel | github.com/sagarm365
+// MITRE ATT&CK: TA0001 Initial Access | TA0010 Exfiltration
+// MITRE ATLAS : AML.T0054 LLM Prompt Injection
+// Platform    : Microsoft Defender XDR Advanced Hunting
+//
+// These queries use AIAgentsInfo — a table most SOC teams
+// don't know exists. It enumerates every Copilot Studio agent
+// in your tenant, their access capabilities, owners, and tools.
+//
+// Companion detection: github.com/sagarm365/ai-threat-detection
+// ============================================================
+
+// ── QUERY 1 ─────────────────────────────────────────────────
+// Published AI agents — full inventory with access details
+// Purpose: Enumerate all non-blocked published agents, their
+//          access capabilities and authentication model
+// MITRE ATLAS: AML.T0054
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| where IsBlocked == false
+| project Timestamp, AIAgentName, AgentStatus,
+          UserAuthenticationType, AccessCapabilities,
+          AgentUsers, AIModel, EnvironmentId
+
+// ── QUERY 2 ─────────────────────────────────────────────────
+// AI agents with many owners — accountability gap
+// Purpose: Agents with > 5 owners have diluted accountability.
+//          If one owner account is compromised, the attacker
+//          controls a published AI agent.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| extend Owners = split(OwnerAccountUpns, ";")
+| extend OwnersCount = array_length(Owners)
+| where OwnersCount > 5
+| project AIAgentName, AIAgentId, OwnersCount, OwnerAccountUpns
+| order by OwnersCount desc
+
+// ── QUERY 3 ─────────────────────────────────────────────────
+// Agents using generative orchestration with broad access
+// Purpose: Highest risk combination — can orchestrate tools
+//          AND accessible to any user / any tenant
+// MITRE ATT&CK: TA0001, TA0010
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| where IsGenerativeOrchestrationEnabled == true
+| where AccessControlPolicy in ("Any", "Any multitenant")
+| project AIAgentName, AIAgentId, CreatorAccountUpn,
+          AccessControlPolicy, AIModel, EnvironmentId
+
+// ── QUERY 4 ─────────────────────────────────────────────────
+// Recently created agents without verified owners
+// Purpose: New agents with no owner set — only a creator.
+//          No accountability chain if the agent misbehaves.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentCreationTime > ago(7d)
+| where isempty(OwnerAccountUpns)
+| project Timestamp, AIAgentName, AIAgentId,
+          CreatorAccountUpn, AgentCreationTime
+
+// ── QUERY 5 ─────────────────────────────────────────────────
+// Agents whose instructions mention sensitive data
+// Purpose: System prompts containing PII/confidential keywords
+//          may be processing regulated data without governance controls
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| where Instructions has_any ("PII", "confidential", "sensitive data",
+    "credit card", "password", "secret", "SSN",
+    "payroll", "acquisition", "salary")
+| project AIAgentName, AIAgentId, CreatorAccountUpn, Instructions
+
+// ── QUERY 6 ─────────────────────────────────────────────────
+// Agents with tools capable of state-changing actions
+// Purpose: Agents with write/delete tools have the highest blast
+//          radius if compromised via prompt injection.
+//          Maps to OWASP LLM08 — Excessive Agency
+// OWASP LLM: LLM08
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| extend Tools = parse_json(AgentToolsDetails)
+| where tostring(AgentToolsDetails) has_any (
+    "delete", "write", "update", "modify", "send", "create")
+| project AIAgentName, AIAgentId, CreatorAccountUpn, AgentToolsDetails
+
+// ── QUERY 7 ─────────────────────────────────────────────────
+// Agents blocked after being published
+// Purpose: Published-then-blocked agents indicate post-publication
+//          security action — investigate why they were blocked.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| where IsBlocked == true
+| project Timestamp, AIAgentName, AIAgentId,
+          CreatorAccountUpn, LastModifiedByUpn
+
+// ── QUERY 8 ─────────────────────────────────────────────────
+// Active AI agents owned by high-risk identities
+// Purpose: If a high-Defender-risk account owns a published agent,
+//          that agent may already be under attacker control.
+// ──────────────────────────────────────────────────────────────
+let riskyAccounts = IdentityAccountInfo
+| where DefenderRiskLevel >= 2
+| project AccountUpn;
+AIAgentsInfo
+| where AgentStatus == "Published"
+| where IsBlocked == false
+| mv-expand Owner = split(OwnerAccountUpns, ";")
+| where Owner in (riskyAccounts.AccountUpn)
+| project Timestamp, AIAgentName, AIAgentId, Owner,
+          AgentStatus, UserAuthenticationType
+
+// ── QUERY 9 ─────────────────────────────────────────────────
+// Multiple AI agents created by same user
+// Purpose: Accounts creating many agents may have over-privilege
+//          or may be building shadow AI infrastructure.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| summarize AgentsCreated = count() by CreatorAccountUpn
+| where AgentsCreated > 3
+| order by AgentsCreated desc
+
+// ── QUERY 10 ────────────────────────────────────────────────
+// AI agents with access to sensitive resources
+// Purpose: Agents with hasSensitiveDataAccess flag present
+//          have elevated data access — require governance review.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| extend Capabilities = parse_json(AccessCapabilities)
+| where tostring(Capabilities.hasSensitiveDataAccess) == "true"
+| project Timestamp, AIAgentName, AIAgentId,
+          CreatorAccountUpn, AccessCapabilities, AIModel
+
+// ── QUERY 11 ────────────────────────────────────────────────
+// Environment concentration — which environments host most agents
+// Purpose: Environments with many agents are high-value targets.
+//          Compromise of that environment = compromise of all agents.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| summarize Agents = count() by EnvironmentId
+| where Agents > 10
+| order by Agents desc
+
+// ── QUERY 12 ────────────────────────────────────────────────
+// AI model family inventory
+// Purpose: Know which LLM families are in production.
+//          Required for AI risk and compliance reporting.
+// ──────────────────────────────────────────────────────────────
+AIAgentsInfo
+| where AgentStatus == "Published"
+| where AIModel has_any ("gpt", "phi", "llama", "mistral", "claude", "gemini")
+| summarize Count = count() by AIModel
+| order by Count desc
+
+// ── QUERY 13 ────────────────────────────────────────────────
+// Users who used AI agents then showed risky cloud activity
+// Purpose: Post-agent-interaction anomalies may indicate XPIA
+//          execution — the agent was manipulated and the user's
+//          session was used to perform unauthorized actions.
+// MITRE ATLAS: AML.T0054
+// ──────────────────────────────────────────────────────────────
+let agentUsers = AIAgentsInfo
+| mv-expand User = split(AgentUsers, ";")
+| summarize by User;
+CloudAppEvents
+| where Timestamp > ago(7d)
+| where AccountUpn in (agentUsers.User)
+| where UncommonForUser has_any ("ActivityType", "ActionType")
+| summarize AnomalousEvents = count() by AccountUpn
+| order by AnomalousEvents desc
+
+// ── QUERY 14 ────────────────────────────────────────────────
+// High-criticality nodes in exposure graph
+// Purpose: Assets that are internet-exposed AND vulnerable to RCE
+//          are the highest priority attack path targets.
+// ──────────────────────────────────────────────────────────────
+ExposureGraphNodes
+| where Timestamp > ago(7d)
+| extend Props = parse_json(NodeProperties)
+| extend IsInternetExposed = tostring(Props.isInternetExposed),
+         HasCriticalVuln = tostring(Props.hasRemoteCodeExecutionVulnerability)
+| where IsInternetExposed == "true" or HasCriticalVuln == "true"
+| project NodeId, NodeName, NodeLabel, Categories,
+          IsInternetExposed, HasCriticalVuln
+
+// ── QUERY 15 ────────────────────────────────────────────────
+// Attack paths involving specific device or user
+// Purpose: Enumerate all attack path connections to/from
+//          a high-value target. Replace target value before running.
+// ──────────────────────────────────────────────────────────────
+let target = "HOSTNAME_OR_UPN_HERE";  // << replace this
+let nodeIds =
+    ExposureGraphNodes
+    | where NodeName == target or NodeLabel == target
+    | project NodeId;
+ExposureGraphEdges
+| where SourceNodeId in (nodeIds) or TargetNodeId in (nodeIds)
+| project EdgeLabel, SourceNodeName, TargetNodeName, EdgeProperties
